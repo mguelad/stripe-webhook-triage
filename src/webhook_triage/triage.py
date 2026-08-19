@@ -19,6 +19,23 @@ def event_findings(record: Mapping[str, Any]) -> list[dict[str, str]]:
             }
         )
 
+    if bool(record.get("semantic_duplicate")):
+        related_event_id = record.get("related_event_id")
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "related_event_duplicate",
+                "message": (
+                    "A different event ID was already received for the same event type "
+                    "and Stripe object."
+                ),
+                "action": (
+                    f"Compare this event with {related_event_id} and make downstream "
+                    "processing idempotent for the event type and object ID."
+                ),
+            }
+        )
+
     if bool(record["payload_changed"]):
         findings.append(
             {
@@ -47,6 +64,7 @@ def event_response(record: Mapping[str, Any]) -> dict[str, Any]:
     response["livemode"] = bool(response["livemode"])
     response["payload_changed"] = bool(response["payload_changed"])
     response["duplicate"] = int(response["delivery_count"]) > 1
+    response["semantic_duplicate"] = bool(response["semantic_duplicate"])
     response["findings"] = event_findings(response)
     return response
 
@@ -83,6 +101,21 @@ def summary_findings(summary: Mapping[str, int]) -> list[dict[str, str]]:
                 "code": "payload_mismatches_present",
                 "message": "At least one event ID was seen with different payload hashes.",
                 "action": "Investigate the sender and any middleware modifying request bodies.",
+            }
+        )
+
+    if summary["semantic_duplicates"]:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "related_event_duplicates_present",
+                "message": (
+                    "Different event IDs were observed for the same event type and object ID."
+                ),
+                "action": (
+                    "Review the related events and deduplicate downstream processing using "
+                    "the event type and object ID."
+                ),
             }
         )
 

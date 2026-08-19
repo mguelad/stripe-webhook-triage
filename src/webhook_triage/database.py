@@ -31,13 +31,15 @@ class Database:
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
     def initialize(self) -> None:
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -45,6 +47,7 @@ class Database:
                     event_type TEXT NOT NULL,
                     api_version TEXT,
                     object_type TEXT,
+                    object_id TEXT,
                     livemode INTEGER NOT NULL CHECK (livemode IN (0, 1)),
                     stripe_created INTEGER,
                     first_received_at TEXT NOT NULL,
@@ -53,7 +56,10 @@ class Database:
                     first_payload_sha256 TEXT NOT NULL,
                     last_payload_sha256 TEXT NOT NULL,
                     payload_changed INTEGER NOT NULL DEFAULT 0
-                        CHECK (payload_changed IN (0, 1))
+                        CHECK (payload_changed IN (0, 1)),
+                    semantic_duplicate INTEGER NOT NULL DEFAULT 0
+                        CHECK (semantic_duplicate IN (0, 1)),
+                    related_event_id TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_webhook_events_type
@@ -79,6 +85,34 @@ class Database:
                 """
             )
 
+            # Upgrade databases created by version 0.1 without discarding their records.
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(webhook_events)")
+            }
+            if "object_id" not in columns:
+                connection.execute("ALTER TABLE webhook_events ADD COLUMN object_id TEXT")
+            if "semantic_duplicate" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE webhook_events
+                    ADD COLUMN semantic_duplicate INTEGER NOT NULL DEFAULT 0
+                    CHECK (semantic_duplicate IN (0, 1))
+                    """
+                )
+            if "related_event_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE webhook_events ADD COLUMN related_event_id TEXT"
+                )
+
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_webhook_events_object
+                ON webhook_events(event_type, object_id)
+                """
+            )
+            connection.execute("PRAGMA user_version = 2")
+
     def record_invalid_attempt(self, payload_sha256: str, error_code: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -95,9 +129,14 @@ class Database:
         object_data = _mapping(_mapping(event_data.get("data")).get("object"))
         event_id = str(event_data["id"])
         event_type = str(event_data["type"])
+        object_id_value = object_data.get("id")
+        object_id = str(object_id_value) if object_id_value else None
         now = _utc_now()
 
         with self._connect() as connection:
+            # Lock before checking for an existing ID so two concurrent deliveries cannot
+            # both try to insert the same event.
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
                 SELECT delivery_count, first_payload_sha256, payload_changed
@@ -124,6 +163,21 @@ class Database:
                 )
                 outcome = "duplicate"
             else:
+                related_event_id = None
+                if object_id:
+                    related = connection.execute(
+                        """
+                        SELECT event_id
+                        FROM webhook_events
+                        WHERE event_type = ? AND object_id = ?
+                        ORDER BY first_received_at ASC, event_id ASC
+                        LIMIT 1
+                        """,
+                        (event_type, object_id),
+                    ).fetchone()
+                    if related:
+                        related_event_id = str(related["event_id"])
+
                 connection.execute(
                     """
                     INSERT INTO webhook_events (
@@ -131,6 +185,7 @@ class Database:
                         event_type,
                         api_version,
                         object_type,
+                        object_id,
                         livemode,
                         stripe_created,
                         first_received_at,
@@ -138,20 +193,25 @@ class Database:
                         delivery_count,
                         first_payload_sha256,
                         last_payload_sha256,
-                        payload_changed
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)
+                        payload_changed,
+                        semantic_duplicate,
+                        related_event_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?)
                     """,
                     (
                         event_id,
                         event_type,
                         event_data.get("api_version"),
                         object_data.get("object"),
+                        object_id,
                         int(bool(event_data.get("livemode"))),
                         event_data.get("created"),
                         now,
                         now,
                         payload_sha256,
                         payload_sha256,
+                        int(related_event_id is not None),
+                        related_event_id,
                     ),
                 )
                 outcome = "accepted"
@@ -225,7 +285,8 @@ class Database:
                     COUNT(*) AS unique_events,
                     COALESCE(SUM(delivery_count), 0) AS valid_deliveries,
                     COALESCE(SUM(delivery_count - 1), 0) AS duplicate_deliveries,
-                    COALESCE(SUM(payload_changed), 0) AS payload_mismatches
+                    COALESCE(SUM(payload_changed), 0) AS payload_mismatches,
+                    COALESCE(SUM(semantic_duplicate), 0) AS semantic_duplicates
                 FROM webhook_events
                 """
             ).fetchone()
@@ -243,4 +304,5 @@ class Database:
             "duplicate_deliveries": int(event_totals["duplicate_deliveries"]),
             "invalid_deliveries": int(invalid_total["invalid_deliveries"]),
             "payload_mismatches": int(event_totals["payload_mismatches"]),
+            "semantic_duplicates": int(event_totals["semantic_duplicates"]),
         }

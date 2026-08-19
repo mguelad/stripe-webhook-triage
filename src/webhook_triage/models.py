@@ -19,6 +19,8 @@ class WebhookAcknowledgement(BaseModel):
     event_id: str
     event_type: str
     duplicate: bool
+    semantic_duplicate: bool
+    related_event_id: str | None
     delivery_count: int = Field(ge=1)
     findings: list[Finding]
 
@@ -28,6 +30,7 @@ class EventRecord(BaseModel):
     event_type: str
     api_version: str | None
     object_type: str | None
+    object_id: str | None
     livemode: bool
     stripe_created: int | None
     first_received_at: str
@@ -37,6 +40,8 @@ class EventRecord(BaseModel):
     last_payload_sha256: str
     payload_changed: bool
     duplicate: bool
+    semantic_duplicate: bool
+    related_event_id: str | None
     findings: list[Finding]
 
 
@@ -56,11 +61,11 @@ class Summary(BaseModel):
     duplicate_deliveries: int = Field(ge=0)
     invalid_deliveries: int = Field(ge=0)
     payload_mismatches: int = Field(ge=0)
+    semantic_duplicates: int = Field(ge=0)
     findings: list[Finding]
 
 
 class Health(BaseModel):
     status: Literal["ok", "degraded"]
     webhook_secret_configured: bool
-    database_path: str
-
+    diagnostic_auth_configured: bool

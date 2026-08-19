@@ -13,6 +13,7 @@ class Settings:
 
     webhook_secret: str
     database_path: Path
+    diagnostic_token: str = ""
     signature_tolerance_seconds: int = 300
 
     @classmethod
@@ -31,5 +32,6 @@ class Settings:
         return cls(
             webhook_secret=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
             database_path=Path(os.getenv("TRIAGE_DATABASE_PATH", "data/triage.db")),
+            diagnostic_token=os.getenv("TRIAGE_DIAGNOSTIC_TOKEN", ""),
             signature_tolerance_seconds=tolerance,
         )
