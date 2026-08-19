@@ -1,42 +1,43 @@
 # Stripe Webhook Triage Tool
 
-A small support-engineering service that receives Stripe webhook deliveries, verifies their
-signatures, records diagnostic metadata in SQLite, detects duplicates, and exposes a concise
-triage summary.
+A local diagnostic receiver for reproducing Stripe webhook problems. It verifies incoming
+signatures, records delivery metadata in SQLite, and turns common failure patterns into short,
+actionable findings.
 
-The project is designed around a common support problem: a customer says that a webhook was
-missed, delivered more than once, or rejected. The tool creates an auditable delivery trail
-without storing the full webhook payload by default.
+## Why I built it
 
-## What it currently does
+Webhook cases often begin with a broad report such as “the event was missed” or “the customer was
+charged twice.” I wanted a small tool that gives support engineers a reliable timeline before they
+start guessing: was the request signed correctly, did the same event arrive again, or did two
+different Stripe events refer to the same underlying object?
 
-- Verifies the raw request body with Stripe's official Python library.
-- Stores event and delivery-attempt metadata in SQLite.
-- Detects repeated event IDs and payload-hash mismatches.
-- Records missing or invalid signatures as failed delivery attempts.
-- Provides event, attempt, and aggregate triage endpoints.
-- Includes a CLI for querying the same SQLite data during an investigation.
-- Avoids storing full webhook payloads, API keys, or signing secrets.
+The tool stores hashes and operational metadata instead of full webhook payloads. This keeps the
+investigation useful while reducing the amount of customer data kept locally.
 
-## Architecture
+## What it detects
 
-```text
-Stripe CLI / Stripe
-        |
-        v
-POST /webhooks/stripe
-        |
-        +-- signature verification
-        +-- idempotency and payload-hash checks
-        +-- SQLite event + attempt records
-        |
-        v
-/events  /attempts  /triage/summary  CLI
-```
+| Signal | Meaning | Suggested next step |
+| --- | --- | --- |
+| Invalid or missing signature | The delivery could not be verified. | Check the endpoint secret, raw request body, and `Stripe-Signature` header. |
+| Repeated Event ID | Stripe delivered the same Event object more than once. | Return `2xx` and make the handler idempotent. |
+| Related-event duplicate | Different Event IDs have the same event type and `data.object.id`. | Compare the events and protect downstream work with the event type and object ID. |
+| Payload hash mismatch | The same Event ID arrived with different raw bytes. | Check middleware or any component that changes the request body. |
+
+Stripe recommends logging processed Event IDs and notes that, in some cases, separate Event
+objects can represent the same underlying event. See Stripe's guidance on
+[handling duplicate events](https://docs.stripe.com/webhooks#handle-duplicate-events).
+
+## Scope
+
+This is a local reproduction and triage tool. It does not inspect a customer's existing endpoint,
+query Stripe Workbench, retry Stripe deliveries, or proxy production traffic. It should not
+replace a production webhook handler. Use Stripe
+[Workbench](https://docs.stripe.com/workbench) for the delivery history of a real endpoint and this
+tool when you want a controlled receiver for testing and investigation.
 
 ## Quick start
 
-Requirements: Python 3.11+ and the Stripe CLI for end-to-end local testing.
+Requirements: Python 3.11+. The Stripe CLI is only needed for the end-to-end example.
 
 ```bash
 python -m venv .venv
@@ -45,46 +46,103 @@ python -m pip install -e ".[dev]"
 
 export STRIPE_WEBHOOK_SECRET=whsec_replace_me
 export TRIAGE_DATABASE_PATH=data/triage.db
+export TRIAGE_DIAGNOSTIC_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 
-uvicorn webhook_triage.app:app --reload --port 4242
+uvicorn webhook_triage.app:app --reload --host 127.0.0.1 --port 4242
 ```
 
-In a second terminal, forward sandbox events to the local endpoint:
+In a second terminal, forward Stripe sandbox events to the receiver:
 
 ```bash
-stripe listen --forward-to http://localhost:4242/webhooks/stripe
+stripe listen --forward-to http://127.0.0.1:4242/webhooks/stripe
 ```
 
-Use the `whsec_...` secret printed by `stripe listen` as `STRIPE_WEBHOOK_SECRET`, restart the
-application, and trigger an event:
+Copy the `whsec_...` secret printed by `stripe listen` into `STRIPE_WEBHOOK_SECRET`, restart the
+application, and send an event:
 
 ```bash
 stripe trigger payment_intent.succeeded
 ```
 
-The Stripe CLI signing secret is different from the secret of a Dashboard-managed webhook
-endpoint. Use the secret belonging to the source that sends the event.
+The Stripe CLI signing secret is different from the secret of a Workbench-managed endpoint. Always
+use the secret belonging to the source sending the event. Stripe also requires the unmodified raw
+request body for [signature verification](https://docs.stripe.com/webhooks/signature).
+
+## Inspect the result
+
+The webhook receiver remains open to Stripe deliveries. The diagnostic endpoints require the
+bearer token configured above:
+
+```bash
+curl -H "Authorization: Bearer $TRIAGE_DIAGNOSTIC_TOKEN" \
+  http://127.0.0.1:4242/triage/summary
+
+curl -H "Authorization: Bearer $TRIAGE_DIAGNOSTIC_TOKEN" \
+  "http://127.0.0.1:4242/events?event_type=payment_intent.succeeded"
+```
+
+The same data is available locally through the CLI:
+
+```bash
+webhook-triage summary
+webhook-triage events --limit 20
+webhook-triage show evt_example
+webhook-triage attempts --limit 20
+```
+
+An investigation with one Event ID redelivery and one related-event duplicate produces a summary
+like this:
+
+```json
+{
+  "unique_events": 2,
+  "valid_deliveries": 3,
+  "duplicate_deliveries": 1,
+  "semantic_duplicates": 1,
+  "invalid_deliveries": 0,
+  "payload_mismatches": 0,
+  "findings": [
+    {
+      "severity": "info",
+      "code": "duplicates_present",
+      "message": "Duplicate deliveries were observed.",
+      "action": "Confirm that downstream handlers are idempotent."
+    },
+    {
+      "severity": "warning",
+      "code": "related_event_duplicates_present",
+      "message": "Different event IDs were observed for the same event type and object ID.",
+      "action": "Review the related events and deduplicate downstream processing using the event type and object ID."
+    }
+  ]
+}
+```
 
 ## API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Check service and signing-secret configuration. |
-| `POST` | `/webhooks/stripe` | Verify and record a Stripe webhook delivery. |
-| `GET` | `/events` | List unique events and duplicate indicators. |
-| `GET` | `/events/{event_id}` | Inspect one event's delivery history. |
-| `GET` | `/attempts` | Inspect recent valid and rejected attempts. |
-| `GET` | `/triage/summary` | View aggregate failures and duplicate signals. |
-| `GET` | `/docs` | Open FastAPI's interactive API documentation. |
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/health` | Public | Report whether signing and diagnostic authentication are configured. |
+| `POST` | `/webhooks/stripe` | Stripe signature | Verify and record a delivery. |
+| `GET` | `/events` | Bearer token | List events and duplicate indicators. |
+| `GET` | `/events/{event_id}` | Bearer token | Inspect one event. |
+| `GET` | `/attempts` | Bearer token | Inspect accepted and rejected delivery attempts. |
+| `GET` | `/triage/summary` | Bearer token | View aggregate findings. |
+| `GET` | `/docs` | Public | Open FastAPI's interactive API documentation. |
 
-Examples:
+## Data and security choices
 
-```bash
-curl http://localhost:4242/triage/summary
-curl "http://localhost:4242/events?event_type=payment_intent.succeeded"
-webhook-triage summary
-webhook-triage events --limit 20
-```
+- Signature verification uses the unmodified request body and Stripe's official Python library.
+- Signing secrets and diagnostic tokens come from environment variables and are never persisted.
+- Raw webhook payloads are not stored; only diagnostic metadata and SHA-256 hashes are kept.
+- Diagnostic HTTP routes require a bearer token and are disabled when no token is configured.
+- `/health` exposes configuration booleans, not secrets or local filesystem paths.
+- SQLite writes use a transaction lock so concurrent redeliveries are counted atomically.
+- Duplicate deliveries receive a quick `200` acknowledgement, following Stripe's
+  [webhook best practices](https://docs.stripe.com/webhooks#best-practices-for-using-webhooks).
+
+Keep the service bound to `127.0.0.1` unless you add the network controls, TLS, monitoring, and
+operational safeguards required for a hosted environment.
 
 ## Tests and quality checks
 
@@ -93,22 +151,7 @@ pytest
 ruff check .
 ```
 
-The API tests generate Stripe-compatible signatures locally. They do not need a Stripe account,
-API key, or network connection.
-
-## Data and security choices
-
-- Signature verification uses the unmodified request body.
-- The signing secret comes only from an environment variable.
-- Raw payloads are not persisted; only operational metadata and SHA-256 hashes are stored.
-- Duplicate event IDs are acknowledged with `200` and recorded, supporting idempotent handling.
-- This is a learning and diagnostic project, not a production payment processor.
-
-## Roadmap
-
-- Add filters for time windows, event types, and failure codes.
-- Add retry-gap and delivery-latency diagnostics.
-- Export a redacted investigation report for customer escalations.
-- Add PostgreSQL support and database migrations.
-- Add authentication before any hosted deployment.
-
+The test suite covers valid deliveries, signature failures, malformed requests, both duplicate
+patterns, concurrent redeliveries, diagnostic authentication, configuration errors, and event
+filtering. It generates Stripe-compatible signatures locally, so tests do not need a Stripe
+account, API key, or network connection.
