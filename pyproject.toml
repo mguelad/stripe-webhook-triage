@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stripe-webhook-triage"
+version = "0.1.0"
+description = "A support-focused service for receiving and diagnosing Stripe webhook deliveries."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Miguelangel Martin" }]
+dependencies = [
+  "fastapi>=0.116,<1",
+  "stripe>=15.4,<16",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx2>=2.10,<3",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+webhook-triage = "webhook_triage.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/webhook_triage"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
