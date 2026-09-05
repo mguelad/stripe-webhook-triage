@@ -113,6 +113,27 @@ class Database:
             )
             connection.execute("PRAGMA user_version = 2")
 
+    def clear(self) -> dict[str, int]:
+        """Remove stored triage results while preserving the database schema."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            event_count = int(
+                connection.execute("SELECT COUNT(*) FROM webhook_events").fetchone()[0]
+            )
+            attempt_count = int(
+                connection.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0]
+            )
+            connection.execute("DELETE FROM delivery_attempts")
+            connection.execute("DELETE FROM webhook_events")
+            connection.execute(
+                "DELETE FROM sqlite_sequence WHERE name = 'delivery_attempts'"
+            )
+
+        return {
+            "cleared_events": event_count,
+            "cleared_attempts": attempt_count,
+        }
+
     def record_invalid_attempt(self, payload_sha256: str, error_code: str) -> None:
         with self._connect() as connection:
             connection.execute(
