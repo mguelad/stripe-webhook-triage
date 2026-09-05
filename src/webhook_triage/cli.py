@@ -37,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     attempts = subparsers.add_parser("attempts", help="List recent delivery attempts")
     attempts.add_argument("--limit", type=int, default=20)
+
+    reset = subparsers.add_parser(
+        "reset",
+        help="Clear all stored events and delivery attempts",
+    )
+    reset.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt",
+    )
     return parser
 
 
@@ -72,6 +82,21 @@ def main() -> None:
         _print_json(event_response(record))
         return
 
+    if args.command == "reset":
+        if not args.yes:
+            try:
+                answer = input(
+                    f"Clear all stored triage results from {database.path}? [y/N] "
+                )
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("Reset cancelled.")
+                return
+
+        _print_json({"database": str(database.path), **database.clear()})
+        return
+
     if not 1 <= args.limit <= 200:
         parser.error("--limit must be between 1 and 200")
     _print_json(database.list_attempts(limit=args.limit))
@@ -79,4 +104,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

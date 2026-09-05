@@ -90,6 +90,16 @@ webhook-triage show evt_example
 webhook-triage attempts --limit 20
 ```
 
+To start a fresh diagnostic session, stop incoming deliveries and clear the stored results:
+
+```bash
+webhook-triage reset
+```
+
+The command shows the configured SQLite path and asks for confirmation before deleting event and
+delivery-attempt rows. It preserves the database file and schema. For deliberate automation, use
+`webhook-triage reset --yes`.
+
 An investigation with one Event ID redelivery and one related-event duplicate produces a summary
 like this:
 

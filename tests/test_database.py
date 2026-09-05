@@ -152,3 +152,26 @@ def test_invalid_attempt_and_event_filtering(tmp_path: Path) -> None:
     assert [record["event_id"] for record in filtered] == ["evt_customer"]
     assert database.summary()["invalid_deliveries"] == 1
     assert any(attempt["error_code"] == "invalid_signature" for attempt in attempts)
+
+
+def test_clear_removes_results_and_keeps_database_usable(tmp_path: Path) -> None:
+    database = Database(tmp_path / "triage.db")
+    database.initialize()
+    database.record_invalid_attempt("bad-hash", "invalid_signature")
+    database.record_event(sample_event(), "valid-hash")
+
+    cleared = database.clear()
+
+    assert cleared == {"cleared_events": 1, "cleared_attempts": 2}
+    assert database.summary() == {
+        "unique_events": 0,
+        "valid_deliveries": 0,
+        "duplicate_deliveries": 0,
+        "invalid_deliveries": 0,
+        "payload_mismatches": 0,
+        "semantic_duplicates": 0,
+    }
+    assert database.list_attempts() == []
+
+    stored = database.record_event(sample_event("evt_after_reset"), "new-hash")
+    assert stored["event_id"] == "evt_after_reset"
